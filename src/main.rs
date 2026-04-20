@@ -1,3 +1,4 @@
+// ========== DOSYA: sentinel-storage/src/main.rs ==========
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use prost::Message;
@@ -8,7 +9,7 @@ use qdrant_client::Qdrant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub mod sentinel_protos {
@@ -22,31 +23,52 @@ pub mod sentinel_protos {
 use sentinel_protos::execution::ExecutionReport;
 use sentinel_protos::market::{AggTrade, MarketStateVector};
 
+// Yardımcı fonksiyon: QuestDB'ye dirençli (resilient) bağlantı sağlar
+async fn connect_questdb_with_retry(url: &str) -> TcpStream {
+    loop {
+        match TcpStream::connect(url).await {
+            Ok(stream) => {
+                info!("✅ QuestDB bağlantısı sağlandı: {}", url);
+                return stream;
+            }
+            Err(e) => {
+                warn!(
+                    "⚠️ QuestDB bağlantı hatası, 3 saniye sonra deneniyor... Hata: {}",
+                    e
+                );
+                sleep(Duration::from_secs(3)).await;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
     let questdb_url = std::env::var("QUESTDB_URL").unwrap_or_else(|_| "127.0.0.1:9009".to_string());
+    let qdrant_url =
+        std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6334".to_string());
 
     let nats_client = async_nats::connect(&nats_url)
         .await
         .context("NATS bağlantı hatası")?;
 
-    let qdrant_url =
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6334".to_string());
+    // Qdrant Bağlantı Döngüsü (Güvenli)
     let mut qdrant_client = None;
     for i in 1..=10 {
         if let Ok(client) = Qdrant::from_url(&qdrant_url).build() {
             if client.health_check().await.is_ok() {
                 qdrant_client = Some(client);
+                info!("✅ Qdrant bağlandı.");
                 break;
             }
         }
         warn!("⚠️ Qdrant hazır değil, bekleniyor... ({}/10)", i);
         sleep(Duration::from_secs(2)).await;
     }
-    let qdrant_client = qdrant_client.expect("❌ Qdrant'a bağlanılamadı!");
+    let qdrant_client = qdrant_client.context("❌ Qdrant'a bağlanılamadı!")?;
 
     if !qdrant_client.collection_exists("market_states").await? {
         qdrant_client
@@ -58,11 +80,18 @@ async fn main() -> Result<()> {
     }
 
     // 1. HAM VERİ YAZICISI
-    let nats_clone_1 = nats_client.clone();
-    let qdb_url_1 = questdb_url.clone();
+    let nats_c1 = nats_client.clone();
+    let qdb_u1 = questdb_url.clone();
     tokio::spawn(async move {
-        let mut sub = nats_clone_1.subscribe("market.trade.>").await.unwrap();
-        let mut stream = TcpStream::connect(&qdb_url_1).await.unwrap();
+        let mut sub = match nats_c1.subscribe("market.trade.>").await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Ham veri NATS aboneliği başarısız: {}", e);
+                return;
+            }
+        };
+        let mut stream = connect_questdb_with_retry(&qdb_u1).await;
+
         while let Some(msg) = sub.next().await {
             if let Ok(trade) = AggTrade::decode(msg.payload) {
                 let line = format!(
@@ -73,20 +102,30 @@ async fn main() -> Result<()> {
                     trade.is_buyer_maker,
                     trade.timestamp * 1_000_000
                 );
-                let _ = stream.write_all(line.as_bytes()).await;
+                if stream.write_all(line.as_bytes()).await.is_err() {
+                    warn!("QuestDB Yazma Hatası (Ham Veri)! Yeniden bağlanılıyor...");
+                    stream = connect_questdb_with_retry(&qdb_u1).await; // Reconnect
+                }
             }
         }
     });
 
-    // 2. VEKTÖR VE AI DUYGU YAZICISI (Hem Qdrant Hem QuestDB'ye yazar)
-    let nats_clone_2 = nats_client.clone();
-    let qdb_url_2 = questdb_url.clone(); // YENİ: QuestDB bağlantısı
+    // 2. VEKTÖR VE AI DUYGU YAZICISI
+    let nats_c2 = nats_client.clone();
+    let qdb_u2 = questdb_url.clone();
     tokio::spawn(async move {
-        let mut sub = nats_clone_2.subscribe("state.vector.>").await.unwrap();
-        let mut stream = TcpStream::connect(&qdb_url_2).await.unwrap(); // YENİ: TCP Akışı
+        let mut sub = match nats_c2.subscribe("state.vector.>").await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Vektör aboneliği başarısız: {}", e);
+                return;
+            }
+        };
+        let mut stream = connect_questdb_with_retry(&qdb_u2).await;
+
         while let Some(msg) = sub.next().await {
             if let Ok(state) = MarketStateVector::decode(msg.payload) {
-                // A) Qdrant'a Vektör Gönder
+                // A) Qdrant'a Vektör Gönder (Hata yoksayılır, devam edilir)
                 let point = PointStruct::new(
                     Uuid::new_v4().to_string(),
                     vec![
@@ -103,24 +142,30 @@ async fn main() -> Result<()> {
                     .upsert_points(UpsertPointsBuilder::new("market_states", vec![point]))
                     .await;
 
-                // B) QuestDB'ye AI Skorunu Gönder (GRAFANA RADARI İÇİN EKLENDİ)
+                // B) QuestDB'ye AI Skorunu Gönder
                 let line = format!(
                     "market_states,symbol={} velocity={},imbalance={},sentiment_score={} {}\n",
                     state.symbol,
                     state.price_velocity,
                     state.volume_imbalance,
                     state.sentiment_score,
-                    chrono::Utc::now().timestamp_nanos_opt().unwrap()
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) // unwrap kaldırıldı
                 );
-                let _ = stream.write_all(line.as_bytes()).await;
+                if stream.write_all(line.as_bytes()).await.is_err() {
+                    warn!("QuestDB Yazma Hatası (Market State)! Yeniden bağlanılıyor...");
+                    stream = connect_questdb_with_retry(&qdb_u2).await;
+                }
             }
         }
     });
 
-    // 3. PAPER TRADE YAZICISI
-    let mut sub = nats_client.subscribe("execution.report.>").await?;
-    let mut stream = TcpStream::connect(&questdb_url).await?;
-    info!("💾 Paralel Storage Motoru devrede.");
+    // 3. PAPER TRADE / EXECUTION YAZICISI
+    let mut sub = nats_client
+        .subscribe("execution.report.>")
+        .await
+        .context("Execution raporlarına abone olunamadı")?;
+    let mut stream = connect_questdb_with_retry(&questdb_url).await;
+    info!("💾 Paralel Storage Motoru (Zero-Tolerance) devrede.");
 
     while let Some(msg) = sub.next().await {
         if let Ok(rep) = ExecutionReport::decode(msg.payload) {
@@ -132,9 +177,12 @@ async fn main() -> Result<()> {
                 rep.quantity,
                 rep.realized_pnl,
                 rep.commission,
-                chrono::Utc::now().timestamp_nanos_opt().unwrap()
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
             );
-            let _ = stream.write_all(line.as_bytes()).await;
+            if stream.write_all(line.as_bytes()).await.is_err() {
+                warn!("QuestDB Yazma Hatası (Execution)! Yeniden bağlanılıyor...");
+                stream = connect_questdb_with_retry(&questdb_url).await;
+            }
         }
     }
     Ok(())
