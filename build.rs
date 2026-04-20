@@ -1,8 +1,9 @@
 // ========== DOSYA: sentinel-storage/build.rs ==========
-use std::io::Result;
-
-fn main() -> Result<()> {
-    println!("cargo:rerun-if-changed=proto/market_data.proto");
-    prost_build::compile_protos(&["proto/market_data.proto"], &["proto/"])?;
+fn main() -> std::io::Result<()> {
+    // sentinel-spec'den proto/ klasörüne iki dosyayı da kopyaladığından emin ol!
+    prost_build::compile_protos(
+        &["proto/market_data.proto", "proto/execution.proto"],
+        &["proto/"]
+    )?;
     Ok(())
 }
