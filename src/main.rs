@@ -33,7 +33,6 @@ async fn main() -> Result<()> {
         .await
         .context("NATS bağlantı hatası")?;
 
-    // QDRANT RETRY LOGIC (Çökmeyi Önler)
     let qdrant_url =
         std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6334".to_string());
     let mut qdrant_client = None;
@@ -79,12 +78,15 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 2. VEKTÖR YAZICISI
+    // 2. VEKTÖR VE AI DUYGU YAZICISI (Hem Qdrant Hem QuestDB'ye yazar)
     let nats_clone_2 = nats_client.clone();
+    let qdb_url_2 = questdb_url.clone(); // YENİ: QuestDB bağlantısı
     tokio::spawn(async move {
         let mut sub = nats_clone_2.subscribe("state.vector.>").await.unwrap();
+        let mut stream = TcpStream::connect(&qdb_url_2).await.unwrap(); // YENİ: TCP Akışı
         while let Some(msg) = sub.next().await {
             if let Ok(state) = MarketStateVector::decode(msg.payload) {
+                // A) Qdrant'a Vektör Gönder
                 let point = PointStruct::new(
                     Uuid::new_v4().to_string(),
                     vec![
@@ -93,13 +95,24 @@ async fn main() -> Result<()> {
                         state.sentiment_score as f32,
                     ],
                     [
-                        ("symbol", state.symbol.into()),
+                        ("symbol", state.symbol.clone().into()),
                         ("velocity", state.price_velocity.into()),
                     ],
                 );
                 let _ = qdrant_client
                     .upsert_points(UpsertPointsBuilder::new("market_states", vec![point]))
                     .await;
+
+                // B) QuestDB'ye AI Skorunu Gönder (GRAFANA RADARI İÇİN EKLENDİ)
+                let line = format!(
+                    "market_states,symbol={} velocity={},imbalance={},sentiment_score={} {}\n",
+                    state.symbol,
+                    state.price_velocity,
+                    state.volume_imbalance,
+                    state.sentiment_score,
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap()
+                );
+                let _ = stream.write_all(line.as_bytes()).await;
             }
         }
     });
