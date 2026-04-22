@@ -23,7 +23,6 @@ pub mod sentinel_protos {
 use sentinel_protos::execution::ExecutionReport;
 use sentinel_protos::market::{AggTrade, MarketStateVector};
 
-// Yardımcı fonksiyon: QuestDB'ye dirençli (resilient) bağlantı sağlar
 async fn connect_questdb_with_retry(url: &str) -> TcpStream {
     loop {
         match TcpStream::connect(url).await {
@@ -55,7 +54,6 @@ async fn main() -> Result<()> {
         .await
         .context("NATS bağlantı hatası")?;
 
-    // Qdrant Bağlantı Döngüsü (Güvenli)
     let mut qdrant_client = None;
     for i in 1..=10 {
         if let Ok(client) = Qdrant::from_url(&qdrant_url).build() {
@@ -79,7 +77,6 @@ async fn main() -> Result<()> {
             .await?;
     }
 
-    // 1. HAM VERİ YAZICISI
     let nats_c1 = nats_client.clone();
     let qdb_u1 = questdb_url.clone();
     tokio::spawn(async move {
@@ -104,13 +101,12 @@ async fn main() -> Result<()> {
                 );
                 if stream.write_all(line.as_bytes()).await.is_err() {
                     warn!("QuestDB Yazma Hatası (Ham Veri)! Yeniden bağlanılıyor...");
-                    stream = connect_questdb_with_retry(&qdb_u1).await; // Reconnect
+                    stream = connect_questdb_with_retry(&qdb_u1).await;
                 }
             }
         }
     });
 
-    // 2. VEKTÖR VE AI DUYGU YAZICISI
     let nats_c2 = nats_client.clone();
     let qdb_u2 = questdb_url.clone();
     tokio::spawn(async move {
@@ -125,7 +121,7 @@ async fn main() -> Result<()> {
 
         while let Some(msg) = sub.next().await {
             if let Ok(state) = MarketStateVector::decode(msg.payload) {
-                // A) Qdrant'a Vektör Gönder (Hata yoksayılır, devam edilir)
+                // YENİ: TIMESTAMP PAYLOAD'A EKLENDİ (Inference'in arama yapabilmesi için)
                 let point = PointStruct::new(
                     Uuid::new_v4().to_string(),
                     vec![
@@ -136,20 +132,20 @@ async fn main() -> Result<()> {
                     [
                         ("symbol", state.symbol.clone().into()),
                         ("velocity", state.price_velocity.into()),
+                        ("timestamp", (state.window_end_time).into()),
                     ],
                 );
                 let _ = qdrant_client
                     .upsert_points(UpsertPointsBuilder::new("market_states", vec![point]))
                     .await;
 
-                // B) QuestDB'ye AI Skorunu Gönder
                 let line = format!(
                     "market_states,symbol={} velocity={},imbalance={},sentiment_score={} {}\n",
                     state.symbol,
                     state.price_velocity,
                     state.volume_imbalance,
                     state.sentiment_score,
-                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) // unwrap kaldırıldı
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
                 );
                 if stream.write_all(line.as_bytes()).await.is_err() {
                     warn!("QuestDB Yazma Hatası (Market State)! Yeniden bağlanılıyor...");
@@ -159,7 +155,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 3. PAPER TRADE / EXECUTION YAZICISI
     let mut sub = nats_client
         .subscribe("execution.report.>")
         .await
