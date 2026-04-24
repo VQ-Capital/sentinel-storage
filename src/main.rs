@@ -19,9 +19,13 @@ pub mod sentinel_protos {
     pub mod execution {
         include!(concat!(env!("OUT_DIR"), "/sentinel.execution.v1.rs"));
     }
+    pub mod intelligence {
+        include!(concat!(env!("OUT_DIR"), "/sentinel.intelligence.v1.rs"));
+    }
 }
 use sentinel_protos::execution::ExecutionReport;
-use sentinel_protos::market::{AggTrade, MarketStateVector};
+use sentinel_protos::intelligence::SemanticVector;
+use sentinel_protos::market::{AggTrade, MarketStateVector, RawNewsEvent};
 
 async fn connect_questdb_with_retry(url: &str) -> TcpStream {
     loop {
@@ -77,6 +81,9 @@ async fn main() -> Result<()> {
             .await?;
     }
 
+    info!("💾 Paralel Storage Motoru (Zero-Tolerance + NLP Memory) devrede.");
+
+    // 1. DİNLEYİCİ: HAM PİYASA VERİLERİ (Trades)
     let nats_c1 = nats_client.clone();
     let qdb_u1 = questdb_url.clone();
     tokio::spawn(async move {
@@ -107,8 +114,10 @@ async fn main() -> Result<()> {
         }
     });
 
+    // 2. DİNLEYİCİ: PİYASA DURUM VEKTÖRLERİ (Market States)
     let nats_c2 = nats_client.clone();
     let qdb_u2 = questdb_url.clone();
+    let qdrant_c2 = qdrant_client.clone();
     tokio::spawn(async move {
         let mut sub = match nats_c2.subscribe("state.vector.>").await {
             Ok(s) => s,
@@ -121,7 +130,6 @@ async fn main() -> Result<()> {
 
         while let Some(msg) = sub.next().await {
             if let Ok(state) = MarketStateVector::decode(msg.payload) {
-                // YENİ: TIMESTAMP PAYLOAD'A EKLENDİ (Inference'in arama yapabilmesi için)
                 let point = PointStruct::new(
                     Uuid::new_v4().to_string(),
                     vec![
@@ -135,7 +143,7 @@ async fn main() -> Result<()> {
                         ("timestamp", (state.window_end_time).into()),
                     ],
                 );
-                let _ = qdrant_client
+                let _ = qdrant_c2
                     .upsert_points(UpsertPointsBuilder::new("market_states", vec![point]))
                     .await;
 
@@ -155,30 +163,105 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut sub = nats_client
-        .subscribe("execution.report.>")
-        .await
-        .context("Execution raporlarına abone olunamadı")?;
-    let mut stream = connect_questdb_with_retry(&questdb_url).await;
-    info!("💾 Paralel Storage Motoru (Zero-Tolerance) devrede.");
+    // 3. DİNLEYİCİ: İŞLEM RAPORLARI (Execution Reports)
+    let nats_c3 = nats_client.clone();
+    let qdb_u3 = questdb_url.clone();
+    tokio::spawn(async move {
+        let mut sub = match nats_c3.subscribe("execution.report.>").await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Execution rapor aboneliği başarısız: {}", e);
+                return;
+            }
+        };
+        let mut stream = connect_questdb_with_retry(&qdb_u3).await;
 
-    while let Some(msg) = sub.next().await {
-        if let Ok(rep) = ExecutionReport::decode(msg.payload) {
-            let line = format!(
-                "paper_trades,symbol={},side={} exec_price={},qty={},pnl={},commission={} {}\n",
-                rep.symbol,
-                rep.side,
-                rep.execution_price,
-                rep.quantity,
-                rep.realized_pnl,
-                rep.commission,
-                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-            );
-            if stream.write_all(line.as_bytes()).await.is_err() {
-                warn!("QuestDB Yazma Hatası (Execution)! Yeniden bağlanılıyor...");
-                stream = connect_questdb_with_retry(&questdb_url).await;
+        while let Some(msg) = sub.next().await {
+            if let Ok(rep) = ExecutionReport::decode(msg.payload) {
+                let line = format!(
+                    "paper_trades,symbol={},side={} exec_price={},qty={},pnl={},commission={} {}\n",
+                    rep.symbol,
+                    rep.side,
+                    rep.execution_price,
+                    rep.quantity,
+                    rep.realized_pnl,
+                    rep.commission,
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                );
+                if stream.write_all(line.as_bytes()).await.is_err() {
+                    warn!("QuestDB Yazma Hatası (Execution)! Yeniden bağlanılıyor...");
+                    stream = connect_questdb_with_retry(&qdb_u3).await;
+                }
             }
         }
-    }
+    });
+
+    // 4. DİNLEYİCİ: HAM HABER AKIŞI (Raw News)
+    let nats_c4 = nats_client.clone();
+    let qdb_u4 = questdb_url.clone();
+    tokio::spawn(async move {
+        let mut sub = match nats_c4.subscribe("news.raw.>").await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Ham haber NATS aboneliği başarısız: {}", e);
+                return;
+            }
+        };
+        let mut stream = connect_questdb_with_retry(&qdb_u4).await;
+
+        while let Some(msg) = sub.next().await {
+            if let Ok(news) = RawNewsEvent::decode(msg.payload) {
+                // ILP Format kısıtlamaları: Boşluklu String'ler çift tırnakla sarılmalı ve içindeki tırnaklar kaçışlanmalıdır.
+                let safe_headline = news.headline.replace('\"', "\\\"");
+                let line = format!(
+                    "raw_news,source={} headline=\"{}\" {}\n",
+                    news.source,
+                    safe_headline,
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                );
+                if stream.write_all(line.as_bytes()).await.is_err() {
+                    warn!("QuestDB Yazma Hatası (Raw News)! Yeniden bağlanılıyor...");
+                    stream = connect_questdb_with_retry(&qdb_u4).await;
+                }
+            }
+        }
+    });
+
+    // 5. DİNLEYİCİ: SEMANTİK VEKTÖRLER (NLP Sentiment)
+    let nats_c5 = nats_client.clone();
+    let qdb_u5 = questdb_url.clone();
+    tokio::spawn(async move {
+        let mut sub = match nats_c5.subscribe("intelligence.news.vector").await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Semantik vektör NATS aboneliği başarısız: {}", e);
+                return;
+            }
+        };
+        let mut stream = connect_questdb_with_retry(&qdb_u5).await;
+
+        while let Some(msg) = sub.next().await {
+            if let Ok(vec) = SemanticVector::decode(msg.payload) {
+                let safe_headline = vec.original_headline.replace('\"', "\\\"");
+                let line = format!(
+                    "semantic_vectors,symbol={},source={} sentiment_score={},headline=\"{}\" {}\n",
+                    vec.symbol,
+                    vec.source,
+                    vec.sentiment_score,
+                    safe_headline,
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                );
+                if stream.write_all(line.as_bytes()).await.is_err() {
+                    warn!("QuestDB Yazma Hatası (Semantic Vector)! Yeniden bağlanılıyor...");
+                    stream = connect_questdb_with_retry(&qdb_u5).await;
+                }
+            }
+        }
+    });
+
+    // Ana thread'i asılı tut
+    tokio::signal::ctrl_c()
+        .await
+        .context("Sinyal yakalanamadı")?;
     Ok(())
 }
