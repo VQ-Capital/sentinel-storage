@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
         q_client
             .create_collection(
                 CreateCollectionBuilder::new("market_states")
-                    .vectors_config(VectorParamsBuilder::new(3, Distance::Cosine)),
+                    .vectors_config(VectorParamsBuilder::new(4, Distance::Cosine)), // 3 -> 4 yapıldı
             )
             .await?;
     }
