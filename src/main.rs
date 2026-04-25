@@ -121,8 +121,8 @@ async fn main() -> Result<()> {
                             .await;
 
                         // QuestDB Write
-                        let line = format!("market_states,symbol={} z_velocity={},z_imbalance={},z_sentiment={} {}\n",
-                            s.symbol, s.embeddings[0], s.embeddings[1], s.embeddings[2], s.window_end_time * 1000000);
+                        let line = format!("market_states,symbol={} z_velocity={},z_imbalance={},z_sentiment={},z_urgency={} {}\n",
+                            s.symbol, s.embeddings[0], s.embeddings[1], s.embeddings[2], s.embeddings[3], s.window_end_time * 1000000);
                         if stream.write_all(line.as_bytes()).await.is_err() {
                             stream = connect_questdb(&qu2).await;
                         }
