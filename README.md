@@ -1,7 +1,8 @@
-# 💾 sentinel-storage (The Memory)
+# 💾 sentinel-memory-archiver (Legacy: sentinel-storage)
 
-**Sorumluluk:** `NATS` üzerinden akan Protobuf verilerini dinler ve ilgili kalıcı hafızalara (Storage) yazar.
-**Veri Yönlendirmesi:**
-1. `market.trade.*` kanalını dinler -> QuestDB'ye (Zaman serisi arşiv) yazar.
-2. `state.vector.*` kanalını dinler -> Qdrant'a (Vektör veri tabanı) Upsert yapar.
-**Dil:** Rust (`async-nats`, `qdrant-client`, `postgres-client`)
+**Domain:** Time-Series (QuestDB) & Vector Memory (Qdrant) Writing
+**Rol:** Sistemin Hafızası
+
+Sistemin saniyede binlerce mesajı bulan yoğun NATS akışını diske (Storage) asenkron olarak yazar. Olası bağlantı kopukluklarında veritabanı sürücülerini otomatik yeniden bağlar (Auto-Reconnect).
+
+- **Veritabanları:** QuestDB (ILP) ve Qdrant (gRPC)
