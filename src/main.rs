@@ -31,15 +31,16 @@ use sentinel_protos::market::{AggTrade, MarketStateVector}; // FIX: RawNewsEvent
 // -----------------------------------------------------------------------------
 // 🛠️ QUESTDB CONNECTION (Self-Healing)
 // -----------------------------------------------------------------------------
-async fn connect_questdb(url: &str) -> TcpStream {
+async fn connect_questdb(url: &str, label: &str) -> TcpStream {
+    // label eklendi
     loop {
         match TcpStream::connect(url).await {
             Ok(stream) => {
-                info!("✅ QuestDB Link Established: {}", url);
+                info!("✅ QuestDB Link Established for [{}] at {}", label, url); // label loga eklendi
                 return stream;
             }
             Err(e) => {
-                warn!("⚠️ QuestDB Down ({}), retrying in 3s...", e);
+                warn!("⚠️ QuestDB Down for [{}] ({}), retrying...", label, e);
                 sleep(Duration::from_secs(3)).await;
             }
         }
@@ -61,13 +62,35 @@ async fn main() -> Result<()> {
 
     // Qdrant Setup
     let q_client = Qdrant::from_url(&qdrant_url).build()?;
-    if !q_client.collection_exists("market_states").await? {
-        q_client
-            .create_collection(
-                CreateCollectionBuilder::new("market_states")
-                    .vectors_config(VectorParamsBuilder::new(4, Distance::Cosine)), // 3 -> 4 yapıldı
-            )
-            .await?;
+
+    // 🔧 CERRAHİ MÜDAHALE: Depolama servisi için Qdrant senkronizasyon döngüsü
+    info!("🔍 Synchronizing with Qdrant collection manager...");
+    loop {
+        match q_client.collection_exists("market_states").await {
+            Ok(exists) => {
+                if !exists {
+                    if let Err(e) = q_client
+                        .create_collection(
+                            CreateCollectionBuilder::new("market_states")
+                                .vectors_config(VectorParamsBuilder::new(4, Distance::Cosine)),
+                        )
+                        .await
+                    {
+                        warn!("⚠️ Storage-side collection creation failed: {}", e);
+                        sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
+                break; // Başarılı
+            }
+            Err(e) => {
+                warn!(
+                    "⏳ Qdrant not ready for storage connection ({}), retrying...",
+                    e
+                );
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
     }
     let qdrant = Arc::new(q_client);
 
@@ -77,7 +100,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         match n1.subscribe("market.trade.>").await {
             Ok(mut sub) => {
-                let mut stream = connect_questdb(&qu1).await;
+                let mut stream = connect_questdb(&qu1, "Trades").await;
                 while let Some(msg) = sub.next().await {
                     if let Ok(t) = AggTrade::decode(msg.payload) {
                         let line = format!(
@@ -88,7 +111,7 @@ async fn main() -> Result<()> {
                             t.timestamp * 1000000
                         );
                         if stream.write_all(line.as_bytes()).await.is_err() {
-                            stream = connect_questdb(&qu1).await;
+                            stream = connect_questdb(&qu1, "Trades").await;
                         }
                     }
                 }
@@ -104,7 +127,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         match n2.subscribe("state.vector.>").await {
             Ok(mut sub) => {
-                let mut stream = connect_questdb(&qu2).await;
+                let mut stream = connect_questdb(&qu2, "MarketStates").await;
                 while let Some(msg) = sub.next().await {
                     if let Ok(s) = MarketStateVector::decode(msg.payload) {
                         // Qdrant Upsert
@@ -124,7 +147,7 @@ async fn main() -> Result<()> {
                         let line = format!("market_states,symbol={} z_velocity={},z_imbalance={},z_sentiment={},z_urgency={} {}\n",
                             s.symbol, s.embeddings[0], s.embeddings[1], s.embeddings[2], s.embeddings[3], s.window_end_time * 1000000);
                         if stream.write_all(line.as_bytes()).await.is_err() {
-                            stream = connect_questdb(&qu2).await;
+                            stream = connect_questdb(&qu2, "MarketStates").await;
                         }
                     }
                 }
@@ -139,13 +162,13 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         match n3.subscribe("execution.report.>").await {
             Ok(mut sub) => {
-                let mut stream = connect_questdb(&qu3).await;
+                let mut stream = connect_questdb(&qu3, "ExecutionReports").await;
                 while let Some(msg) = sub.next().await {
                     if let Ok(r) = ExecutionReport::decode(msg.payload) {
                         let line = format!("paper_trades,symbol={},side={} exec_price={},qty={},pnl={},latency_ms={} {}\n",
                             r.symbol, r.side, r.execution_price, r.quantity, r.realized_pnl, r.latency_ms, r.timestamp * 1000000);
                         if stream.write_all(line.as_bytes()).await.is_err() {
-                            stream = connect_questdb(&qu3).await;
+                            stream = connect_questdb(&qu3, "ExecutionReports").await;
                         }
                     }
                 }
@@ -160,7 +183,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         match n4.subscribe("intelligence.news.vector").await {
             Ok(mut sub) => {
-                let mut stream = connect_questdb(&qu4).await;
+                let mut stream = connect_questdb(&qu4, "SemanticVectors").await;
                 while let Some(msg) = sub.next().await {
                     if let Ok(v) = SemanticVector::decode(msg.payload) {
                         let line = format!(
@@ -171,7 +194,7 @@ async fn main() -> Result<()> {
                             v.timestamp * 1000000
                         );
                         if stream.write_all(line.as_bytes()).await.is_err() {
-                            stream = connect_questdb(&qu4).await;
+                            stream = connect_questdb(&qu4, "SemanticVectors").await;
                         }
                     }
                 }
