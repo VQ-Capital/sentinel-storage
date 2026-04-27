@@ -5,6 +5,7 @@ fn main() -> std::io::Result<()> {
             "sentinel-spec/proto/sentinel/market/v1/market_data.proto",
             "sentinel-spec/proto/sentinel/execution/v1/execution.proto",
             "sentinel-spec/proto/sentinel/intelligence/v1/intelligence.proto",
+            "sentinel-spec/proto/sentinel/wallet/v1/wallet.proto",
         ],
         &["sentinel-spec/proto/"],
     )?;
