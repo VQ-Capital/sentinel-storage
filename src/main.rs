@@ -113,17 +113,24 @@ async fn main() -> Result<()> {
         if let Ok(mut sub) = n2.subscribe("state.vector.>").await {
             while let Some(msg) = sub.next().await {
                 if let Ok(s) = MarketStateVector::decode(msg.payload) {
+                    // 🔥 CERRAHİ: Qdrant Payload'ına Z-Score meta verileri eklendi!
                     let point = PointStruct::new(
                         Uuid::new_v4().to_string(),
                         s.embeddings.iter().map(|&x| x as f32).collect::<Vec<f32>>(),
                         [
                             ("symbol", s.symbol.clone().into()),
                             ("timestamp", s.window_end_time.into()),
+                            ("velocity", s.price_velocity.into()),
+                            ("imbalance", s.volume_imbalance.into()),
+                            ("sentiment", s.sentiment_score.into()),
+                            ("urgency", s.chain_urgency.into()),
+                            ("is_gold", s.is_gold.into()),
                         ],
                     );
                     let _ = qd2
                         .upsert_points(UpsertPointsBuilder::new("market_states", vec![point]))
                         .await;
+
                     let line = format!("market_states,symbol={} z_velocity={},z_imbalance={},z_sentiment={},z_urgency={} {}\n", s.symbol, s.embeddings[0], s.embeddings[1], s.embeddings[2], s.embeddings[3], s.window_end_time * 1000000);
                     if stream.write_all(line.as_bytes()).await.is_err() {
                         stream = connect_questdb(&qu2, "MarketStates").await;
@@ -173,7 +180,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 🚀 5. YENİ: KURUMSAL PERFORMANS KAYDI (Wallet Snapshot)
+    // 5. Kurumsal Performans Kaydı
     let n5 = nats_client.clone();
     let qu5 = questdb_url.clone();
     tokio::spawn(async move {
