@@ -13,24 +13,36 @@ use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-pub mod sentinel_protos {
+mod config;
+use config::StorageConfig;
+
+pub mod sentinel {
     pub mod market {
-        include!(concat!(env!("OUT_DIR"), "/sentinel.market.v1.rs"));
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/sentinel.market.v1.rs"));
+        }
     }
     pub mod execution {
-        include!(concat!(env!("OUT_DIR"), "/sentinel.execution.v1.rs"));
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/sentinel.execution.v1.rs"));
+        }
     }
     pub mod intelligence {
-        include!(concat!(env!("OUT_DIR"), "/sentinel.intelligence.v1.rs"));
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/sentinel.intelligence.v1.rs"));
+        }
     }
     pub mod wallet {
-        include!(concat!(env!("OUT_DIR"), "/sentinel.wallet.v1.rs"));
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/sentinel.wallet.v1.rs"));
+        }
     }
 }
-use sentinel_protos::execution::ExecutionReport;
-use sentinel_protos::intelligence::SemanticVector;
-use sentinel_protos::market::{AggTrade, MarketStateVector};
-use sentinel_protos::wallet::EquitySnapshot;
+
+use sentinel::execution::v1::{ExecutionRejection, ExecutionReport};
+use sentinel::intelligence::v1::SemanticVector;
+use sentinel::market::v1::{AggTrade, MarketStateVector};
+use sentinel::wallet::v1::EquitySnapshot;
 
 async fn connect_questdb(url: &str, label: &str) -> TcpStream {
     loop {
@@ -51,30 +63,31 @@ async fn connect_questdb(url: &str, label: &str) -> TcpStream {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    let config = StorageConfig::from_env();
+
     info!(
-        "📡 Service: {} | Version: 0.5.0 (V5 12D Unified Storage)",
+        "📡 Service: {} | Version: 0.6.1 (V7 MODULAR STORAGE)",
         env!("CARGO_PKG_NAME")
     );
 
-    let nats_url =
-        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-    let questdb_url = std::env::var("QUESTDB_URL").unwrap_or_else(|_| "127.0.0.1:9009".to_string());
-    let qdrant_url =
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
-    let nats_client = async_nats::connect(&nats_url).await.context("NATS Error")?;
+    let nats_client = async_nats::connect(&config.nats_url)
+        .await
+        .context("NATS Error")?;
 
-    // 🔥 KRİTİK GÜNCELLEME: 12 Boyutlu Koleksiyon İsmi market_states_12d
-    let q_client = Qdrant::from_url(&qdrant_url).build()?;
+    let q_client = Qdrant::from_url(&config.qdrant_url).build()?;
     loop {
-        if let Ok(exists) = q_client.collection_exists("market_states_12d").await {
+        if let Ok(exists) = q_client.collection_exists(&config.qdrant_collection).await {
             if !exists {
                 let _ = q_client
                     .create_collection(
-                        CreateCollectionBuilder::new("market_states_12d")
+                        CreateCollectionBuilder::new(&config.qdrant_collection)
                             .vectors_config(VectorParamsBuilder::new(12, Distance::Cosine)),
                     )
                     .await;
-                info!("💎 Qdrant: 'market_states_12d' collection initialized with 12 dimensions.");
+                info!(
+                    "💎 Qdrant: '{}' collection initialized with 12 dimensions.",
+                    config.qdrant_collection
+                );
             }
             break;
         }
@@ -83,9 +96,9 @@ async fn main() -> Result<()> {
     }
     let qdrant = Arc::new(q_client);
 
-    // 1. Trades (Ham Borsa Verisi)
+    // 1. Trades
     let n1 = nats_client.clone();
-    let qu1 = questdb_url.clone();
+    let qu1 = config.questdb_url.clone();
     tokio::spawn(async move {
         let mut stream = connect_questdb(&qu1, "Trades").await;
         if let Ok(mut sub) = n1.subscribe("market.trade.>").await {
@@ -106,16 +119,16 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 2. Market States (Vektör Hafıza ve Z-Score Analizi)
+    // 2. Market States
     let n2 = nats_client.clone();
-    let qu2 = questdb_url.clone();
+    let qu2 = config.questdb_url.clone();
+    let q_col = config.qdrant_collection.clone();
     let qd2 = qdrant.clone();
     tokio::spawn(async move {
         let mut stream = connect_questdb(&qu2, "MarketStates").await;
         if let Ok(mut sub) = n2.subscribe("state.vector.>").await {
             while let Some(msg) = sub.next().await {
                 if let Ok(s) = MarketStateVector::decode(msg.payload) {
-                    // Qdrant'a 12 Boyutlu Vektörü ve Meta Verileri Kaydet
                     if s.embeddings.len() == 12 {
                         let point = PointStruct::new(
                             Uuid::new_v4().to_string(),
@@ -130,14 +143,10 @@ async fn main() -> Result<()> {
                             ],
                         );
                         let _ = qd2
-                            .upsert_points(UpsertPointsBuilder::new(
-                                "market_states_12d",
-                                vec![point],
-                            ))
+                            .upsert_points(UpsertPointsBuilder::new(&q_col, vec![point]))
                             .await;
                     }
 
-                    // QuestDB'ye Z-Score Verilerini Yaz (Grafana Radar İçin)
                     let line = format!("market_states,symbol={} z_velocity={},z_imbalance={},z_sentiment={},z_urgency={} {}\n",
                         s.symbol, s.embeddings[0], s.embeddings[1], s.embeddings[2], s.embeddings[3], s.window_end_time * 1000000);
                     if stream.write_all(line.as_bytes()).await.is_err() {
@@ -148,9 +157,9 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 3. Execution Reports (Gerçekleşen İşlemler)
+    // 3. Execution Reports
     let n3 = nats_client.clone();
-    let qu3 = questdb_url.clone();
+    let qu3 = config.questdb_url.clone();
     tokio::spawn(async move {
         let mut stream = connect_questdb(&qu3, "ExecutionReports").await;
         if let Ok(mut sub) = n3.subscribe("execution.report.>").await {
@@ -166,9 +175,9 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 4. Semantic Vectors (Haber Analizleri)
+    // 4. Semantic Vectors
     let n4 = nats_client.clone();
-    let qu4 = questdb_url.clone();
+    let qu4 = config.questdb_url.clone();
     tokio::spawn(async move {
         let mut stream = connect_questdb(&qu4, "SemanticVectors").await;
         if let Ok(mut sub) = n4.subscribe("intelligence.news.vector").await {
@@ -189,19 +198,37 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 5. Performance (Hazine ve Portföy Durumu)
+    // 5. Performance
     let n5 = nats_client.clone();
-    let qu5 = questdb_url.clone();
+    let qu5 = config.questdb_url.clone();
     tokio::spawn(async move {
         let mut stream = connect_questdb(&qu5, "Performance").await;
         if let Ok(mut sub) = n5.subscribe("wallet.equity.snapshot").await {
             while let Some(msg) = sub.next().await {
                 if let Ok(e) = EquitySnapshot::decode(msg.payload) {
-                    // 🔥 CERRAHİ: sharpe_ratio geri eklendi!
                     let line = format!("performance equity={},balance={},unrealized_pnl={},drawdown_pct={},sharpe_ratio={} {}\n",
                         e.total_equity_usd, e.available_margin_usd, e.total_unrealized_pnl, e.max_drawdown_pct, e.sharpe_ratio, e.timestamp * 1000000);
                     if stream.write_all(line.as_bytes()).await.is_err() {
                         stream = connect_questdb(&qu5, "Performance").await;
+                    }
+                }
+            }
+        }
+    });
+
+    // 6. Execution Rejections
+    let n6 = nats_client.clone();
+    let qu6 = config.questdb_url.clone();
+    tokio::spawn(async move {
+        let mut stream = connect_questdb(&qu6, "Rejections").await;
+        if let Ok(mut sub) = n6.subscribe("execution.rejection.>").await {
+            while let Some(msg) = sub.next().await {
+                if let Ok(r) = ExecutionRejection::decode(msg.payload) {
+                    let desc_clean = r.description.replace(' ', "_").replace(['"', ','], "");
+                    let line = format!("execution_rejections,symbol={},reason_code={} original_side=\"{}\",desc=\"{}\" {}\n",
+                        r.symbol, r.reason_code, r.original_side, desc_clean, r.timestamp * 1000000);
+                    if stream.write_all(line.as_bytes()).await.is_err() {
+                        stream = connect_questdb(&qu6, "Rejections").await;
                     }
                 }
             }
