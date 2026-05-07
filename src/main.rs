@@ -9,6 +9,7 @@ use qdrant_client::Qdrant;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -62,11 +63,10 @@ async fn connect_questdb(url: &str, label: &str) -> TcpStream {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-
     let config = StorageConfig::from_env();
 
     info!(
-        "📡 Service: {} | Version: 0.6.1 (V7 MODULAR STORAGE)",
+        "📡 Service: {} | Version: 0.7.0 (V8 MICRO-BATCH STORAGE)",
         env!("CARGO_PKG_NAME")
     );
 
@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
                     )
                     .await;
                 info!(
-                    "💎 Qdrant: '{}' collection initialized with 12 dimensions.",
+                    "💎 Qdrant: '{}' collection initialized.",
                     config.qdrant_collection
                 );
             }
@@ -95,6 +95,32 @@ async fn main() -> Result<()> {
         sleep(Duration::from_secs(2)).await;
     }
     let qdrant = Arc::new(q_client);
+
+    // 🚀 CERRAHİ: Qdrant Micro-Batching Engine (DDOS Önleme)
+    let (tx_qdrant, mut rx_qdrant) = mpsc::channel::<PointStruct>(10000);
+    let qd_batch = qdrant.clone();
+    let q_col_batch = config.qdrant_collection.clone();
+    tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(200);
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if !batch.is_empty() {
+                        let _ = qd_batch.upsert_points(UpsertPointsBuilder::new(&q_col_batch, batch.clone())).await;
+                        batch.clear(); // Zero-Allocation (Capacity korunur)
+                    }
+                }
+                Some(point) = rx_qdrant.recv() => {
+                    batch.push(point);
+                    if batch.len() >= 200 {
+                        let _ = qd_batch.upsert_points(UpsertPointsBuilder::new(&q_col_batch, batch.clone())).await;
+                        batch.clear();
+                    }
+                }
+            }
+        }
+    });
 
     // 1. Trades
     let n1 = nats_client.clone();
@@ -122,8 +148,6 @@ async fn main() -> Result<()> {
     // 2. Market States
     let n2 = nats_client.clone();
     let qu2 = config.questdb_url.clone();
-    let q_col = config.qdrant_collection.clone();
-    let qd2 = qdrant.clone();
     tokio::spawn(async move {
         let mut stream = connect_questdb(&qu2, "MarketStates").await;
         if let Ok(mut sub) = n2.subscribe("state.vector.>").await {
@@ -142,11 +166,8 @@ async fn main() -> Result<()> {
                                 ("urgency", s.chain_urgency.into()),
                             ],
                         );
-                        let _ = qd2
-                            .upsert_points(UpsertPointsBuilder::new(&q_col, vec![point]))
-                            .await;
+                        let _ = tx_qdrant.send(point).await; // Buffer'a gönder
                     }
-
                     let line = format!("market_states,symbol={} z_velocity={},z_imbalance={},z_sentiment={},z_urgency={} {}\n",
                         s.symbol, s.embeddings[0], s.embeddings[1], s.embeddings[2], s.embeddings[3], s.window_end_time * 1000000);
                     if stream.write_all(line.as_bytes()).await.is_err() {
