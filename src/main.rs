@@ -45,6 +45,55 @@ use sentinel::intelligence::v1::SemanticVector;
 use sentinel::market::v1::{AggTrade, MarketStateVector};
 use sentinel::wallet::v1::EquitySnapshot;
 
+// 🚀 YENİ: Veritabanı ön yükleme (Diagnose çökmesini önler)
+async fn bootstrap_questdb(rest_url: &str) {
+    let client = reqwest::Client::new();
+    let queries = vec![
+        "CREATE TABLE IF NOT EXISTS trades (symbol SYMBOL, price DOUBLE, qty DOUBLE, timestamp TIMESTAMP) timestamp(timestamp) PARTITION BY DAY WAL;",
+        "CREATE TABLE IF NOT EXISTS paper_trades (symbol SYMBOL, side SYMBOL, order_id SYMBOL, exec_price DOUBLE, qty DOUBLE, pnl DOUBLE, latency_ms LONG, timestamp TIMESTAMP) timestamp(timestamp) PARTITION BY DAY WAL;",
+        "CREATE TABLE IF NOT EXISTS market_states (symbol SYMBOL, z_velocity DOUBLE, z_imbalance DOUBLE, z_sentiment DOUBLE, z_urgency DOUBLE, timestamp TIMESTAMP) timestamp(timestamp) PARTITION BY DAY WAL;",
+        "CREATE TABLE IF NOT EXISTS semantic_vectors (symbol SYMBOL, source SYMBOL, score DOUBLE, timestamp TIMESTAMP) timestamp(timestamp) PARTITION BY DAY WAL;",
+        "CREATE TABLE IF NOT EXISTS performance (equity DOUBLE, balance DOUBLE, unrealized_pnl DOUBLE, drawdown_pct DOUBLE, sharpe_ratio DOUBLE, timestamp TIMESTAMP) timestamp(timestamp) PARTITION BY DAY WAL;",
+        "CREATE TABLE IF NOT EXISTS execution_rejections (symbol SYMBOL, reason_code SYMBOL, original_side SYMBOL, desc STRING, timestamp TIMESTAMP) timestamp(timestamp) PARTITION BY DAY WAL;",
+    ];
+
+    loop {
+        match client
+            .get(format!("{}/exec?query=SELECT+1", rest_url))
+            .send()
+            .await
+        {
+            Ok(_) => {
+                for q in queries {
+                    let res = client
+                        .get(format!("{}/exec", rest_url))
+                        .query(&[("query", q)])
+                        .send()
+                        .await;
+                    match res {
+                        Ok(r) if r.status().is_success() => info!(
+                            "✅ Bootstrapped table: {}",
+                            q.split(' ').nth(5).unwrap_or("")
+                        ),
+                        Ok(r) => {
+                            warn!("⚠️ Bootstrap issue: {}", r.text().await.unwrap_or_default())
+                        }
+                        Err(e) => warn!("⚠️ QuestDB REST failed: {}", e),
+                    }
+                }
+                break;
+            }
+            Err(_) => {
+                warn!(
+                    "⏳ QuestDB HTTP API is not ready at {}, retrying in 3s...",
+                    rest_url
+                );
+                sleep(Duration::from_secs(3)).await;
+            }
+        }
+    }
+}
+
 async fn connect_questdb(url: &str, label: &str) -> TcpStream {
     loop {
         match TcpStream::connect(url).await {
@@ -66,9 +115,12 @@ async fn main() -> Result<()> {
     let config = StorageConfig::from_env();
 
     info!(
-        "📡 Service: {} | Version: 0.7.0 (V8 MICRO-BATCH STORAGE)",
+        "📡 Service: {} | Version: 0.8.0 (V9 BOOTSTRAPPED STORAGE)",
         env!("CARGO_PKG_NAME")
     );
+
+    // 🚀 QuestDB Tablolarını Ayağa Kaldır
+    bootstrap_questdb(&config.questdb_rest_url).await;
 
     let nats_client = async_nats::connect(&config.nats_url)
         .await
@@ -96,7 +148,7 @@ async fn main() -> Result<()> {
     }
     let qdrant = Arc::new(q_client);
 
-    // 🚀 CERRAHİ: Qdrant Micro-Batching Engine (DDOS Önleme)
+    // Qdrant Micro-Batching Engine (DDOS Önleme)
     let (tx_qdrant, mut rx_qdrant) = mpsc::channel::<PointStruct>(10000);
     let qd_batch = qdrant.clone();
     let q_col_batch = config.qdrant_collection.clone();
@@ -108,7 +160,7 @@ async fn main() -> Result<()> {
                 _ = interval.tick() => {
                     if !batch.is_empty() {
                         let _ = qd_batch.upsert_points(UpsertPointsBuilder::new(&q_col_batch, batch.clone())).await;
-                        batch.clear(); // Zero-Allocation (Capacity korunur)
+                        batch.clear(); // Zero-Allocation
                     }
                 }
                 Some(point) = rx_qdrant.recv() => {
@@ -166,7 +218,7 @@ async fn main() -> Result<()> {
                                 ("urgency", s.chain_urgency.into()),
                             ],
                         );
-                        let _ = tx_qdrant.send(point).await; // Buffer'a gönder
+                        let _ = tx_qdrant.send(point).await;
                     }
                     let line = format!("market_states,symbol={} z_velocity={},z_imbalance={},z_sentiment={},z_urgency={} {}\n",
                         s.symbol, s.embeddings[0], s.embeddings[1], s.embeddings[2], s.embeddings[3], s.window_end_time * 1000000);

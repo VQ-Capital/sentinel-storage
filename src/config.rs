@@ -4,6 +4,7 @@
 pub struct StorageConfig {
     pub nats_url: String,
     pub questdb_url: String,
+    pub questdb_rest_url: String, // 🔥 EKLENDİ
     pub qdrant_url: String,
     pub qdrant_collection: String,
 }
@@ -15,6 +16,8 @@ impl StorageConfig {
                 .unwrap_or_else(|_| "nats://localhost:4222".to_string()),
             questdb_url: std::env::var("QUESTDB_URL")
                 .unwrap_or_else(|_| "127.0.0.1:9009".to_string()),
+            questdb_rest_url: std::env::var("QUESTDB_REST_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string()), // Docker için: http://questdb-archive:9000
             qdrant_url: std::env::var("QDRANT_URL")
                 .unwrap_or_else(|_| "http://localhost:6333".to_string()),
             qdrant_collection: std::env::var("QDRANT_COLLECTION")
